@@ -6,6 +6,8 @@
 //   KV USAGE:  "sub:<subscription_id>"         -> apikey         (reverse lookup for webhooks)
 //   KV USAGE:  "counter:<apikey>:<YYYY-MM>"    -> integer monthly call count
 //   KV USAGE:  "rate:<apikey>:<minute-ts>"     -> integer per-minute count (60s TTL)
+//   KV USAGE:  "team:<owner-apikey>"           -> TeamRecord { member_ids: string[] }  (sidecar; absent => no team members yet)
+//   KV USAGE:  "team-member:<sub-apikey>"      -> TeamMemberRecord { owner_api_key, member_email, created_at, label }
 
 export type Tier = "free" | "solo" | "team" | "pro";
 
@@ -26,6 +28,29 @@ export interface KeyRecord {
   status: "active" | "cancelled" | "past_due";
 }
 
+// Team-member sub-key record: stored at KV USAGE "team-member:<sub-apikey>".
+// Looked up by the auth layer; quota/tier are inherited from the owner's KeyRecord.
+export interface TeamMemberRecord {
+  owner_api_key: string;          // the owner's "mck_*" key whose record drives tier+quota
+  member_email: string;
+  created_at: number;             // unix ms
+  label?: string;                 // optional human label, e.g. "Bob from Eng"
+}
+
+// Sidecar list of team-member sub-keys an owner has issued.
+// Kept separate from KeyRecord so older accounts continue to JSON-parse cleanly.
+export interface TeamRecord {
+  member_ids: string[];           // each entry IS the sub-API-key
+}
+
+// Per-tier seat allowances. Free / solo are locked out of the feature.
+export const TEAM_SEAT_LIMITS: Record<Tier, number> = {
+  free: 0,
+  solo: 0,
+  team: 5,
+  pro: 25,
+};
+
 export function extractBearer(request: Request): string | null {
   const auth = request.headers.get("Authorization") || request.headers.get("authorization");
   if (!auth) return null;
@@ -33,18 +58,67 @@ export function extractBearer(request: Request): string | null {
   return match ? match[1] : null;
 }
 
+export interface ResolvedKey {
+  tier: Tier;
+  owner: string | null;
+  status: KeyRecord["status"] | "anonymous";
+  /**
+   * Key to use for quota counters & rate limits. For a normal owner key this
+   * equals the presented apiKey; for a team-member sub-key it is the OWNER's
+   * key so all sub-key calls roll up against the parent's monthly quota.
+   */
+  effectiveKey: string | null;
+  /** True when the presented key was looked up as a "team-member:" sub-key. */
+  is_team_member?: boolean;
+  /** When is_team_member, the sub-key (== member_id). Useful for audit logging. */
+  member_id?: string;
+}
+
 export async function resolveKey(
   apiKey: string | null,
   usage: KVNamespace
-): Promise<{ tier: Tier; owner: string | null; status: KeyRecord["status"] | "anonymous" }> {
-  if (!apiKey) return { tier: "free", owner: null, status: "anonymous" };
+): Promise<ResolvedKey> {
+  if (!apiKey) return { tier: "free", owner: null, status: "anonymous", effectiveKey: null };
+
+  // 1) Try owner key lookup first (most traffic).
   const rec = await usage.get<KeyRecord>(`key:${apiKey}`, "json");
-  if (!rec) return { tier: "free", owner: null, status: "anonymous" };
-  // A cancelled subscription downgrades to free at its monthlyResetAt.
-  if (rec.status === "cancelled" && Date.now() >= rec.monthlyResetAt) {
-    return { tier: "free", owner: rec.owner, status: rec.status };
+  if (rec) {
+    // A cancelled subscription downgrades to free at its monthlyResetAt.
+    if (rec.status === "cancelled" && Date.now() >= rec.monthlyResetAt) {
+      return { tier: "free", owner: rec.owner, status: rec.status, effectiveKey: apiKey };
+    }
+    return { tier: rec.tier, owner: rec.owner, status: rec.status, effectiveKey: apiKey };
   }
-  return { tier: rec.tier, owner: rec.owner, status: rec.status };
+
+  // 2) Try team-member sub-key lookup. Quota + tier inherited from the owner.
+  const member = await usage.get<TeamMemberRecord>(`team-member:${apiKey}`, "json");
+  if (member) {
+    const ownerRec = await usage.get<KeyRecord>(`key:${member.owner_api_key}`, "json");
+    if (!ownerRec) {
+      // Sub-key still around but owner record gone → treat as revoked / anonymous.
+      return { tier: "free", owner: null, status: "anonymous", effectiveKey: null };
+    }
+    if (ownerRec.status === "cancelled" && Date.now() >= ownerRec.monthlyResetAt) {
+      return {
+        tier: "free",
+        owner: ownerRec.owner,
+        status: ownerRec.status,
+        effectiveKey: member.owner_api_key,
+        is_team_member: true,
+        member_id: apiKey,
+      };
+    }
+    return {
+      tier: ownerRec.tier,
+      owner: ownerRec.owner,
+      status: ownerRec.status,
+      effectiveKey: member.owner_api_key,
+      is_team_member: true,
+      member_id: apiKey,
+    };
+  }
+
+  return { tier: "free", owner: null, status: "anonymous", effectiveKey: null };
 }
 
 export function monthKey(now = Date.now()): string {

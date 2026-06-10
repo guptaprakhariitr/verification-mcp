@@ -2,7 +2,7 @@
 // Vendored identically into every Category-1 product.
 
 import { DodoClient, DodoEnv } from "./dodo";
-import { Tier, TIER_LIMITS, extractBearer, resolveKey, monthKey, generateApiKey, KeyRecord } from "./auth";
+import { Tier, TIER_LIMITS, TEAM_SEAT_LIMITS, extractBearer, resolveKey, monthKey, generateApiKey, KeyRecord, TeamRecord, TeamMemberRecord } from "./auth";
 
 export interface CheckoutEnv extends DodoEnv {
   USAGE: KVNamespace;
@@ -86,19 +86,23 @@ export async function handleAccount(request: Request, env: CheckoutEnv): Promise
   const apiKey = extractBearer(request);
   if (!apiKey) return json({ error: "Missing Authorization header", hint: "Send Authorization: Bearer <your_mck_key>. If you don't have a key yet, visit /upgrade?tier=solo to subscribe." }, 401);
 
-  const { tier, owner, status } = await resolveKey(apiKey, env.USAGE);
+  const resolved = await resolveKey(apiKey, env.USAGE);
+  const { tier, owner, status, effectiveKey, is_team_member, member_id } = resolved;
   if (status === "anonymous") return json({ error: "Unknown API key", hint: "This key was either revoked, never minted, or never reached our records. Contact support if you paid and didn't receive a key." }, 404);
 
-  const rec = await env.USAGE.get<KeyRecord>(`key:${apiKey}`, "json");
+  // For a team-member sub-key, all quota counters live under the OWNER's key.
+  const billingKey = effectiveKey ?? apiKey;
+  const rec = await env.USAGE.get<KeyRecord>(`key:${billingKey}`, "json");
 
   // Pull current month's usage counter so customer can see how much quota remains.
   const month = monthKey();
-  const calls_this_month = parseInt((await env.USAGE.get(`counter:${apiKey}:${month}`)) || "0", 10);
+  const calls_this_month = parseInt((await env.USAGE.get(`counter:${billingKey}:${month}`)) || "0", 10);
   const limit = TIER_LIMITS[tier].monthlyCalls;
   const remaining = Math.max(0, limit - calls_this_month);
 
+  // Only the owner gets a portal link — sub-keys can't manage the subscription.
   let portal_url: string | null = null;
-  if (rec?.customerId) {
+  if (!is_team_member && rec?.customerId) {
     try {
       const dodo = new DodoClient(env);
       portal_url = (await dodo.createCustomerPortalLink(rec.customerId)).portal_url || null;
@@ -111,6 +115,8 @@ export async function handleAccount(request: Request, env: CheckoutEnv): Promise
     tier,
     owner,
     status,
+    is_team_member: is_team_member ?? false,
+    member_id: member_id ?? null,
     usage: {
       month,
       calls_this_month,
@@ -180,6 +186,11 @@ export async function handleAccountExport(request: Request, env: CheckoutEnv): P
   // a 90-day TTL; if the list is empty (e.g. before event logging was wired up), we return [].
   const events = await listRecentEvents(env.USAGE, apiKey);
 
+  // Team members (if any). Sub-key VALUES are hashed in the export — the full
+  // secret is only ever shown once at invite time. This is a "right to know
+  // what you've issued" record, not a credential dump.
+  const teamMembers = await listTeamMembersForExport(env.USAGE, apiKey);
+
   return json({
     exported_at: new Date().toISOString(),
     account: {
@@ -202,6 +213,7 @@ export async function handleAccountExport(request: Request, env: CheckoutEnv): P
       limit: tierLimit,
       month_bucket: month,
     },
+    team_members: teamMembers,
     events,
     notes: "This is a machine-readable export of every record we hold tied to your API key. To request deletion, email prakshatechnologies@gmail.com.",
   });
@@ -438,4 +450,297 @@ function cfSubdomain(): string {
   // Hardcoded for this deployment; products self-deployed under prakhar-cognizance.
   // If multi-tenant, this should come from an env var.
   return "prakhar-cognizance";
+}
+
+// ── Team-member invitations ──────────────────────────────────────────────────
+//
+// A team/pro tier owner can issue N sub-API-keys. Each sub-key:
+//   - Inherits the owner's tier + monthly quota (calls roll up against owner).
+//   - Has its own audit identity (member_id == the sub-key itself).
+//   - Can be revoked independently of the owner's key.
+//
+// KV layout:
+//   "team:<owner-apikey>"        -> TeamRecord  { member_ids: string[] }
+//   "team-member:<sub-apikey>"   -> TeamMemberRecord { owner_api_key, member_email, created_at, label }
+//
+// The sidecar `team:` key keeps existing `key:` records unchanged so older
+// accounts still JSON-parse against the original KeyRecord shape.
+
+interface TeamMemberView {
+  id: string;            // == sub-API-key
+  email: string;
+  label?: string;
+  created_at: string;    // ISO
+}
+
+async function loadTeamRecord(usage: KVNamespace, ownerApiKey: string): Promise<TeamRecord> {
+  return (await usage.get<TeamRecord>(`team:${ownerApiKey}`, "json")) ?? { member_ids: [] };
+}
+
+async function saveTeamRecord(usage: KVNamespace, ownerApiKey: string, rec: TeamRecord): Promise<void> {
+  if (rec.member_ids.length === 0) {
+    await usage.delete(`team:${ownerApiKey}`);
+    return;
+  }
+  await usage.put(`team:${ownerApiKey}`, JSON.stringify(rec));
+}
+
+async function listTeamMembers(usage: KVNamespace, ownerApiKey: string): Promise<TeamMemberView[]> {
+  const team = await loadTeamRecord(usage, ownerApiKey);
+  const out: TeamMemberView[] = [];
+  for (const id of team.member_ids) {
+    const m = await usage.get<TeamMemberRecord>(`team-member:${id}`, "json");
+    if (!m) continue; // dangling reference (e.g. external delete) — skip silently
+    out.push({ id, email: m.member_email, label: m.label, created_at: new Date(m.created_at).toISOString() });
+  }
+  return out;
+}
+
+/**
+ * GET /account/team — list the authenticated owner's current sub-keys.
+ *
+ * - 401 if no Authorization header.
+ * - 404 if the API key is unknown.
+ * - 403 if the caller is on a tier that can't issue team members (free / solo)
+ *   or is themselves a sub-key (only the owner can manage seats).
+ */
+export async function handleTeamList(request: Request, env: CheckoutEnv): Promise<Response> {
+  const apiKey = extractBearer(request);
+  if (!apiKey) return json({ error: "Missing Authorization header", hint: "Send Authorization: Bearer <your owner mck_ key>." }, 401);
+
+  const resolved = await resolveKey(apiKey, env.USAGE);
+  if (resolved.status === "anonymous") return json({ error: "Unknown API key" }, 404);
+  if (resolved.is_team_member) {
+    return json({ error: "Only the team owner can manage seats", hint: "Ask the owner of this subscription to invite or revoke members." }, 403);
+  }
+  const maxSeats = TEAM_SEAT_LIMITS[resolved.tier];
+  if (maxSeats <= 0) {
+    return json({
+      error: "Team invitations require the team or pro tier",
+      tier: resolved.tier,
+      hint: "Upgrade at /upgrade?tier=team to unlock 5 seats, or /upgrade?tier=pro for 25 seats.",
+      upgradeUrl: "/upgrade?tier=team",
+    }, 403);
+  }
+
+  const members = await listTeamMembers(env.USAGE, apiKey);
+  return json({
+    tier: resolved.tier,
+    max_seats: maxSeats,
+    used_seats: members.length,
+    members,
+  });
+}
+
+/**
+ * POST /account/team/invite — mint a sub-API-key for a teammate.
+ * Body: { email: string, label?: string }
+ */
+export async function handleTeamInvite(request: Request, env: CheckoutEnv, origin: string): Promise<Response> {
+  const apiKey = extractBearer(request);
+  if (!apiKey) return json({ error: "Missing Authorization header" }, 401);
+
+  const resolved = await resolveKey(apiKey, env.USAGE);
+  if (resolved.status === "anonymous") return json({ error: "Unknown API key" }, 404);
+  if (resolved.is_team_member) return json({ error: "Only the team owner can invite members" }, 403);
+  const maxSeats = TEAM_SEAT_LIMITS[resolved.tier];
+  if (maxSeats <= 0) {
+    return json({ error: "Team invitations require the team or pro tier", tier: resolved.tier, upgradeUrl: "/upgrade?tier=team" }, 403);
+  }
+
+  let body: { email?: unknown; label?: unknown };
+  try { body = (await request.json()) as { email?: unknown; label?: unknown }; }
+  catch { return json({ error: "Invalid JSON body" }, 400); }
+
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  const label = typeof body.label === "string" ? body.label.trim().slice(0, 80) : undefined;
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return json({ error: "Body must include a valid 'email' string" }, 400);
+  }
+
+  const team = await loadTeamRecord(env.USAGE, apiKey);
+  if (team.member_ids.length >= maxSeats) {
+    return json({
+      error: "Seat limit reached",
+      max_seats: maxSeats,
+      used_seats: team.member_ids.length,
+      hint: resolved.tier === "team" ? "Upgrade to pro for 25 seats: /upgrade?tier=pro" : "Revoke an existing seat before inviting another.",
+    }, 409);
+  }
+
+  // Reject duplicates by email (case-insensitive). O(seats) — capped at 25.
+  for (const id of team.member_ids) {
+    const m = await env.USAGE.get<TeamMemberRecord>(`team-member:${id}`, "json");
+    if (m && m.member_email.toLowerCase() === email) {
+      return json({ error: "Email is already a team member", member_id_hint: id.slice(0, 8) + "…" }, 409);
+    }
+  }
+
+  // Mint sub-key. Distinct prefix so it's visually obvious in logs which keys are sub-keys.
+  const subKey = "tmm_" + crypto.randomUUID().replace(/-/g, "");
+  const memberRec: TeamMemberRecord = {
+    owner_api_key: apiKey,
+    member_email: email,
+    created_at: Date.now(),
+    label,
+  };
+  await env.USAGE.put(`team-member:${subKey}`, JSON.stringify(memberRec));
+  team.member_ids.push(subKey);
+  await saveTeamRecord(env.USAGE, apiKey, team);
+
+  const inviteUrl = `${origin}/team/accept?key=${subKey}`;
+  return json({
+    sub_api_key: subKey,
+    member_id: subKey,
+    invite_url: inviteUrl,
+    note: "Share invite_url with the invitee. We do not send the email for you yet; copy the link manually. The sub-key inherits your tier and quota.",
+  }, 201);
+}
+
+/**
+ * POST /account/team/revoke — delete a sub-API-key the caller owns.
+ * Body: { member_id: string }  (member_id IS the sub-API-key)
+ */
+export async function handleTeamRevoke(request: Request, env: CheckoutEnv): Promise<Response> {
+  const apiKey = extractBearer(request);
+  if (!apiKey) return json({ error: "Missing Authorization header" }, 401);
+
+  const resolved = await resolveKey(apiKey, env.USAGE);
+  if (resolved.status === "anonymous") return json({ error: "Unknown API key" }, 404);
+  if (resolved.is_team_member) return json({ error: "Only the team owner can revoke members" }, 403);
+
+  let body: { member_id?: unknown };
+  try { body = (await request.json()) as { member_id?: unknown }; }
+  catch { return json({ error: "Invalid JSON body" }, 400); }
+
+  const memberId = typeof body.member_id === "string" ? body.member_id : "";
+  if (!memberId) return json({ error: "Body must include 'member_id' (the sub-API-key string)" }, 400);
+
+  const memberRec = await env.USAGE.get<TeamMemberRecord>(`team-member:${memberId}`, "json");
+  if (!memberRec) return json({ error: "Unknown member_id" }, 404);
+  if (memberRec.owner_api_key !== apiKey) {
+    // Don't leak ownership; same response as "not found".
+    return json({ error: "Unknown member_id" }, 404);
+  }
+
+  await env.USAGE.delete(`team-member:${memberId}`);
+  const team = await loadTeamRecord(env.USAGE, apiKey);
+  team.member_ids = team.member_ids.filter((id) => id !== memberId);
+  await saveTeamRecord(env.USAGE, apiKey, team);
+
+  return json({ revoked: true, member_id: memberId });
+}
+
+/**
+ * GET /team/accept?key=<sub-key> — invite landing page (HTML).
+ * No auth: the URL itself is the secret. We confirm the sub-key exists and
+ * show install instructions much like /welcome — minus the upsell, since the
+ * invitee's seat is already paid for by the owner.
+ */
+export async function handleTeamAccept(request: Request, env: CheckoutEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const subKey = url.searchParams.get("key");
+  if (!subKey) {
+    return htmlResponse(teamAcceptErrorHtml("Missing ?key= parameter. Open this URL via the invite link you were sent.", env, url), 400);
+  }
+  const memberRec = await env.USAGE.get<TeamMemberRecord>(`team-member:${subKey}`, "json");
+  if (!memberRec) {
+    return htmlResponse(teamAcceptErrorHtml("This invite link is invalid or has been revoked. Ask the team owner to re-issue an invite.", env, url), 404);
+  }
+  const ownerRec = await env.USAGE.get<KeyRecord>(`key:${memberRec.owner_api_key}`, "json");
+  return htmlResponse(teamAcceptHtml(subKey, memberRec, ownerRec, env, url), 200);
+}
+
+function teamAcceptHtml(subKey: string, member: TeamMemberRecord, ownerRec: KeyRecord | null, env: CheckoutEnv, url: URL): string {
+  const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const tier = (ownerRec?.tier ?? "team") as Tier;
+  const limits = TIER_LIMITS[tier] ?? TIER_LIMITS.team;
+  const meta = buildSocialMeta(env, {
+    title: `Team invite — ${productName}`,
+    description: `Accept your team seat for ${productName}. ${tagline}`,
+    url: `${url.origin}/team/accept`,
+  });
+  const slug = slugFromProduct(env.PRODUCT_NAME);
+  const ownerLine = ownerRec?.owner ? `from <code>${escapeHtml(ownerRec.owner)}</code>` : "from your team owner";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Team invite — ${productName}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>Welcome — your team API key is ready.</h1>
+<p>You've been invited ${ownerLine} to use <strong>${productName}</strong> on the <strong>${tier}</strong> tier. Your calls share the team's pooled quota; you do not need to subscribe separately.</p>
+
+<h2>Your team API key</h2>
+<div class="key">
+  <code id="key">${escapeHtml(subKey)}</code>
+  <button class="btn" onclick="navigator.clipboard.writeText(document.getElementById('key').textContent); this.textContent='Copied'">Copy</button>
+</div>
+<p>Save it now; this page will not be shown again. Anyone with this key can use ${productName} against the team's quota.</p>
+
+<h2>What you get</h2>
+<dl class="meta">
+  <dt>Tier</dt><dd>${tier} (inherited)</dd>
+  <dt>Pooled monthly call limit</dt><dd>${limits.monthlyCalls.toLocaleString()} calls (shared across the team)</dd>
+  <dt>Rate limit</dt><dd>${limits.ratePerMin} calls / minute (shared)</dd>
+  <dt>Invited as</dt><dd>${escapeHtml(member.member_email)}${member.label ? " · " + escapeHtml(member.label) : ""}</dd>
+  <dt>Endpoint</dt><dd>https://${slug}.${cfSubdomain()}.workers.dev/mcp</dd>
+</dl>
+
+<h2>Install in Cursor / Claude Desktop / Cline</h2>
+<pre><code>{
+  "mcpServers": {
+    "${slug}": {
+      "url": "https://${slug}.${cfSubdomain()}.workers.dev/mcp",
+      "headers": { "Authorization": "Bearer ${escapeHtml(subKey)}" }
+    }
+  }
+}</code></pre>
+
+<p class="footer">
+  This key was issued by the team owner and can be revoked at any time from their account.
+  Quota usage rolls up to the owner's subscription — please be mindful when running large batches.
+  Questions? Email <a href="mailto:prakshatechnologies@gmail.com">prakshatechnologies@gmail.com</a>.
+</p>
+</body></html>`;
+}
+
+function teamAcceptErrorHtml(message: string, env: CheckoutEnv, url: URL): string {
+  const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const meta = buildSocialMeta(env, {
+    title: `Invite unavailable — ${productName}`,
+    description: tagline,
+    url: `${url.origin}/team/accept`,
+  });
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Invite unavailable — ${productName}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>This invite isn't available.</h1>
+<div class="error"><p>${escapeHtml(message)}</p></div>
+<p><a href="/" class="btn">Back to ${productName}</a></p>
+</body></html>`;
+}
+
+async function listTeamMembersForExport(usage: KVNamespace, ownerApiKey: string): Promise<Array<{ id_hash: string; email: string; label?: string; created_at: string }>> {
+  const team = await loadTeamRecord(usage, ownerApiKey);
+  const out: Array<{ id_hash: string; email: string; label?: string; created_at: string }> = [];
+  for (const id of team.member_ids) {
+    const m = await usage.get<TeamMemberRecord>(`team-member:${id}`, "json");
+    if (!m) continue;
+    out.push({
+      id_hash: await sha256Hex16(id),
+      email: m.member_email,
+      label: m.label,
+      created_at: new Date(m.created_at).toISOString(),
+    });
+  }
+  return out;
+}
+
+async function sha256Hex16(s: string): Promise<string> {
+  const bytes = new TextEncoder().encode(s);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex.slice(0, 16);
 }

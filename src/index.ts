@@ -3,7 +3,7 @@
 import { extractBearer, resolveKey, Tier } from "./auth";
 import { checkAndIncrement, quotaErrorResponse } from "./billing";
 import { McpServer, ToolContext, isJsonRpcRequest } from "./mcp-server";
-import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleFavicon, buildSocialMeta } from "./checkout";
+import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleFavicon, buildSocialMeta, handleTeamList, handleTeamInvite, handleTeamRevoke, handleTeamAccept } from "./checkout";
 import { handleDodoWebhook } from "./webhook";
 import { buildTools } from "./tools";
 
@@ -44,14 +44,19 @@ export default {
     if (request.method === "GET" && url.pathname === "/account/export") return withCors(await handleAccountExport(request, env));
     if (request.method === "GET" && (url.pathname === "/welcome" || url.pathname === "/welcome.json")) return withCors(await handleWelcome(request, env));
     if (request.method === "POST" && url.pathname === "/account/rotate") return withCors(await handleAccountRotate(request, env));
+    if (request.method === "GET" && url.pathname === "/account/team") return withCors(await handleTeamList(request, env));
+    if (request.method === "POST" && url.pathname === "/account/team/invite") return withCors(await handleTeamInvite(request, env, new URL(request.url).origin));
+    if (request.method === "POST" && url.pathname === "/account/team/revoke") return withCors(await handleTeamRevoke(request, env));
+    if (request.method === "GET" && url.pathname === "/team/accept") return withCors(await handleTeamAccept(request, env));
     if (request.method === "POST" && url.pathname === "/webhooks/dodo") return await handleDodoWebhook(request, env);
     if (url.pathname !== "/mcp") return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
     if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
     const apiKey = extractBearer(request);
-    const { tier } = await resolveKey(apiKey, env.USAGE);
-    const quota = await checkAndIncrement(apiKey, tier, env.USAGE);
+    const resolved = await resolveKey(apiKey, env.USAGE);
+    const tier = resolved.tier;
+    const quota = await checkAndIncrement(resolved.effectiveKey ?? apiKey, tier, env.USAGE);
     if (!quota.allowed) return withCors(quotaErrorResponse(quota, env.UPGRADE_URL));
 
     let body: unknown;
