@@ -355,6 +355,7 @@ export function handleSupportPage(_request: Request, env: CheckoutEnv): Response
   const productName = env.PRODUCT_NAME ?? "your MCP";
   const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
   const productUrl = env.PRODUCT_URL || "";
+  const slug = slugFromProduct(env.PRODUCT_NAME);
   const meta = buildSocialMeta(env, {
     title: `Support — ${productName}`,
     description: `Contact support for ${productName}. ${tagline}`,
@@ -379,6 +380,13 @@ ${meta}
   <div class="form-group"><label for="message">Message</label><textarea id="message" name="message" required maxlength="5000"></textarea></div>
   <button type="submit" class="btn">Send message</button>
 </form>
+
+<h2>Issue tracking</h2>
+<p>Bug reports go to the product's GitHub repo at <a href="https://github.com/guptaprakhariitr/${escapeHtml(slug)}">github.com/guptaprakhariitr/${escapeHtml(slug)}</a>. For account, billing, or data-export requests, use this form.</p>
+
+<h2>Response time</h2>
+<p>We aim to acknowledge within 48 hours and resolve within 7 business days. For urgent security or GDPR requests, email <a href="mailto:prakshatechnologies@gmail.com">prakshatechnologies@gmail.com</a> directly.</p>
+
 <p class="footer">Prefer email? Write to <a href="mailto:prakshatechnologies@gmail.com">prakshatechnologies@gmail.com</a>. For account access, see <a href="/account">/account</a>; for data export, <a href="/account/export">/account/export</a>.</p>
 </body></html>`;
   return htmlResponse(html, 200);

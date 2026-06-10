@@ -35,9 +35,9 @@ for (const t of buildTools()) server.register(t);
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, server: SERVER_INFO });
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/health") return json({ ok: true, server: SERVER_INFO });
     if (request.method === "GET" && url.pathname === "/llms.txt") return new Response(LLMS_TXT, { headers: { "Content-Type": "text/markdown" } });
-    if (request.method === "GET" && (url.pathname === "/favicon.ico" || url.pathname === "/favicon.svg")) return handleFavicon();
+    if ((request.method === "GET" || request.method === "HEAD") && (url.pathname === "/favicon.ico" || url.pathname === "/favicon.svg")) return handleFavicon();
     if (request.method === "GET" && url.pathname === "/") return new Response(renderLanding(env, url), { headers: { "Content-Type": "text/html" } });
     if (request.method === "GET" && url.pathname === "/upgrade") return handleUpgrade(request, env, new URL(request.url).origin);
     if (request.method === "GET" && url.pathname === "/account") return withCors(await handleAccount(request, env));
