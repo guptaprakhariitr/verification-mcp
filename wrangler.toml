@@ -30,6 +30,10 @@ DODO_PRODUCT_ID_PRO  = "pdt_0NgkXBpkVhPcikDQV3vYm"
 FROM_EMAIL = "prakshatechnologies@gmail.com"
 DODO_BASE = "https://live.dodopayments.com"
 CUSTOMER_PORTAL_RETURN_URL = "https://verification-mcp.atlasword.workers.dev/account"
+# Custom pricing band — drives the JSON-LD SoftwareApplication offers on /.
+PRICE_SOLO = "19"
+PRICE_TEAM = "49"
+PRICE_PRO  = "149"
 
 # Secrets:
 #   DODO_API_KEY

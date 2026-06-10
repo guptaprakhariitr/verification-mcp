@@ -3,7 +3,7 @@
 import { extractBearer, resolveKey, Tier } from "./auth";
 import { checkAndIncrement, quotaErrorResponse } from "./billing";
 import { McpServer, ToolContext, isJsonRpcRequest } from "./mcp-server";
-import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleFavicon, buildSocialMeta, handleTeamList, handleTeamInvite, handleTeamRevoke, handleTeamAccept } from "./checkout";
+import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleAccountDelete, handleSupportPage, handleSupportSubmit, handleFavicon, buildSocialMeta, handleTeamList, handleTeamInvite, handleTeamRevoke, handleTeamAccept } from "./checkout";
 import { handleDodoWebhook } from "./webhook";
 import { buildTools } from "./tools";
 
@@ -42,6 +42,10 @@ export default {
     if (request.method === "GET" && url.pathname === "/upgrade") return handleUpgrade(request, env, new URL(request.url).origin);
     if (request.method === "GET" && url.pathname === "/account") return withCors(await handleAccount(request, env));
     if (request.method === "GET" && url.pathname === "/account/export") return withCors(await handleAccountExport(request, env));
+    if (request.method === "DELETE" && url.pathname === "/account") return withCors(await handleAccountDelete(request, env));
+    if (request.method === "POST" && url.pathname === "/account/delete") return withCors(await handleAccountDelete(request, env));
+    if (request.method === "GET" && url.pathname === "/support") return withCors(handleSupportPage(request, env));
+    if (request.method === "POST" && url.pathname === "/support") return withCors(await handleSupportSubmit(request, env));
     if (request.method === "GET" && (url.pathname === "/welcome" || url.pathname === "/welcome.json")) return withCors(await handleWelcome(request, env));
     if (request.method === "POST" && url.pathname === "/account/rotate") return withCors(await handleAccountRotate(request, env));
     if (request.method === "GET" && url.pathname === "/account/team") return withCors(await handleTeamList(request, env));

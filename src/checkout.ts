@@ -9,6 +9,13 @@ export interface CheckoutEnv extends DodoEnv {
   PRODUCT_NAME?: string;
   PRODUCT_TAGLINE?: string;
   PRODUCT_URL?: string;
+  // Optional per-product price overrides for the JSON-LD SoftwareApplication
+  // schema injected into every landing page. Defaults to $9 / $29 / $79 if
+  // unset — products with custom bands (unit-converter, verification,
+  // drug-interaction) set these in wrangler.toml.
+  PRICE_SOLO?: string;
+  PRICE_TEAM?: string;
+  PRICE_PRO?: string;
 }
 
 /**
@@ -219,6 +226,272 @@ export async function handleAccountExport(request: Request, env: CheckoutEnv): P
   });
 }
 
+/**
+ * DELETE /account  OR  POST /account/delete  — GDPR right-to-erasure endpoint.
+ *
+ * Requires Authorization: Bearer <owner-api-key>. For POST, the body must be
+ * `{ "confirm": "delete-my-account" }` — a magic string to make accidental
+ * deletion (curl, browser autofill, etc.) impossible. The DELETE variant skips
+ * the body check because RFC-7231 DELETE bodies are unreliable; the verb
+ * itself is the confirmation.
+ *
+ * Removes:
+ *   - key:<api-key>                    — account record
+ *   - counter:<api-key>:*              — monthly usage counters (all months)
+ *   - rate:<api-key>:*                 — per-minute rate buckets (mostly expired anyway)
+ *   - event:<api-key>:*                — webhook event log (last 90 days)
+ *   - sub:<subscription-id>            — reverse-lookup from subscription
+ *   - team:<api-key>                   — sidecar team-member list
+ *   - team-member:<sub-key>            — every sub-key this owner issued
+ *   - welcome:<token>                  — not deleted; those keys are short-lived and self-expire
+ *
+ * Does NOT cancel the Dodo subscription. Dodo billing is a separate system;
+ * the user must visit the customer portal (link returned in the response).
+ *
+ * Sub-keys (team members) cannot self-erase via this endpoint — only the
+ * owner of a subscription can erase. A team member who wants their data
+ * removed must ask the owner, or the owner can revoke just their sub-key via
+ * POST /account/team/revoke.
+ */
+export async function handleAccountDelete(request: Request, env: CheckoutEnv): Promise<Response> {
+  const apiKey = extractBearer(request);
+  if (!apiKey) {
+    return json({ error: "Missing Authorization header", hint: "Send Authorization: Bearer <your_mck_key>." }, 401);
+  }
+
+  // POST variant requires explicit confirmation. DELETE variant is self-confirming via the verb.
+  if (request.method === "POST") {
+    let body: { confirm?: unknown };
+    try { body = (await request.json()) as { confirm?: unknown }; }
+    catch { return json({ error: "Invalid JSON body", hint: "Send {\"confirm\":\"delete-my-account\"}." }, 400); }
+    if (body.confirm !== "delete-my-account") {
+      return json({ error: "Confirmation required", hint: "Body must be {\"confirm\":\"delete-my-account\"} to proceed." }, 400);
+    }
+  }
+
+  const rec = await env.USAGE.get<KeyRecord>(`key:${apiKey}`, "json");
+  if (!rec) {
+    // Either unknown, or this is a team-member sub-key (which can't self-delete).
+    const member = await env.USAGE.get<TeamMemberRecord>(`team-member:${apiKey}`, "json");
+    if (member) {
+      return json({
+        error: "Team-member sub-keys cannot self-erase",
+        hint: "Ask your team owner to revoke this sub-key via POST /account/team/revoke, or to delete their account.",
+      }, 403);
+    }
+    return json({ error: "Unknown API key" }, 404);
+  }
+
+  let deletedCount = 0;
+
+  // 1) Counters, rates, events: list-and-delete by prefix.
+  for (const prefix of [`counter:${apiKey}:`, `rate:${apiKey}:`, `event:${apiKey}:`]) {
+    deletedCount += await deleteByPrefix(env.USAGE, prefix);
+  }
+
+  // 2) Team members this owner issued (sub-keys + the sidecar list).
+  const team = await env.USAGE.get<TeamRecord>(`team:${apiKey}`, "json");
+  if (team) {
+    for (const subKey of team.member_ids) {
+      await env.USAGE.delete(`team-member:${subKey}`);
+      deletedCount++;
+    }
+    await env.USAGE.delete(`team:${apiKey}`);
+    deletedCount++;
+  }
+
+  // 3) Subscription reverse-lookup.
+  if (rec.subscriptionId) {
+    await env.USAGE.delete(`sub:${rec.subscriptionId}`);
+    deletedCount++;
+  }
+
+  // 4) The account record itself — last, so the above cleanup can't orphan KV
+  // entries if something throws mid-way.
+  await env.USAGE.delete(`key:${apiKey}`);
+  deletedCount++;
+
+  const accountIdHash = await sha256Hex16(apiKey);
+  const portalUrl = env.UPGRADE_URL ? env.UPGRADE_URL.replace(/\/upgrade.*$/, "/account") : null;
+
+  return json({
+    deleted: true,
+    account_id: accountIdHash,
+    keys_deleted_count: deletedCount,
+    message: "Account deleted. To cancel ongoing billing you must ALSO cancel your subscription in the Dodo customer portal — this endpoint only erases our records; it does not stop charges.",
+    dodo_portal_hint: portalUrl ? `Before this deletion, visit ${portalUrl} or your Dodo customer portal email link to cancel the subscription.` : "Cancel your subscription via the Dodo customer portal link in your last receipt email.",
+  });
+}
+
+async function deleteByPrefix(usage: KVNamespace, prefix: string): Promise<number> {
+  let deleted = 0;
+  // KV list pagination — keep going until no cursor returned. Per-prefix
+  // upper bound here is small (≤ a few hundred), so a single page is the
+  // common case but we loop for safety.
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await usage.list({ prefix, limit: 1000, cursor });
+    for (const k of page.keys) {
+      await usage.delete(k.name);
+      deleted++;
+    }
+    if (page.list_complete || !page.cursor) break;
+    cursor = page.cursor;
+  }
+  return deleted;
+}
+
+/**
+ * GET /support — HTML contact form. POSTs to /support; server-side handler
+ * stores the message in KV under `support:<uuid>` with 90-day TTL.
+ *
+ * No email is sent. Operators read pending tickets via:
+ *   wrangler kv key list --binding USAGE --prefix "support:"
+ *   wrangler kv key get  --binding USAGE "support:<uuid>"
+ *
+ * If we add an admin UI later, this is the read source of truth.
+ */
+export function handleSupportPage(_request: Request, env: CheckoutEnv): Response {
+  const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const productUrl = env.PRODUCT_URL || "";
+  const meta = buildSocialMeta(env, {
+    title: `Support — ${productName}`,
+    description: `Contact support for ${productName}. ${tagline}`,
+    url: `${productUrl}/support`,
+  });
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Support — ${escapeHtml(productName)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}
+  .form-group{margin:1em 0}
+  label{display:block;font-weight:600;font-size:.9rem;margin-bottom:.3em;color:#374151}
+  input[type=text],input[type=email],textarea{width:100%;padding:.6em .75em;border:1px solid #d1d5db;border-radius:6px;font:inherit;background:#fff;box-sizing:border-box}
+  textarea{min-height:140px;resize:vertical;font-family:inherit}
+  input:focus,textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.15)}
+</style></head><body>
+<h1>Support</h1>
+<p>Question, bug, or feature request for <strong>${escapeHtml(productName)}</strong>? Drop a message — replies go out from <code>prakshatechnologies@gmail.com</code> within 2 business days.</p>
+<form method="POST" action="/support">
+  <div class="form-group"><label for="name">Your name</label><input type="text" id="name" name="name" required maxlength="120"></div>
+  <div class="form-group"><label for="email">Your email</label><input type="email" id="email" name="email" required maxlength="200"></div>
+  <div class="form-group"><label for="subject">Subject</label><input type="text" id="subject" name="subject" required maxlength="200"></div>
+  <div class="form-group"><label for="message">Message</label><textarea id="message" name="message" required maxlength="5000"></textarea></div>
+  <button type="submit" class="btn">Send message</button>
+</form>
+<p class="footer">Prefer email? Write to <a href="mailto:prakshatechnologies@gmail.com">prakshatechnologies@gmail.com</a>. For account access, see <a href="/account">/account</a>; for data export, <a href="/account/export">/account/export</a>.</p>
+</body></html>`;
+  return htmlResponse(html, 200);
+}
+
+/**
+ * POST /support — accepts form-urlencoded OR JSON body
+ * `{ name, email, subject, message }`. Writes `support:<uuid>` in KV with 90-day TTL.
+ * Returns JSON when Accept: application/json, else an HTML thank-you page.
+ */
+export async function handleSupportSubmit(request: Request, env: CheckoutEnv): Promise<Response> {
+  const wantsJson = (request.headers.get("Accept") || "").includes("application/json");
+
+  let name = "", email = "", subject = "", message = "";
+  const ct = (request.headers.get("Content-Type") || "").toLowerCase();
+  try {
+    if (ct.includes("application/json")) {
+      const body = (await request.json()) as Record<string, unknown>;
+      name = typeof body.name === "string" ? body.name : "";
+      email = typeof body.email === "string" ? body.email : "";
+      subject = typeof body.subject === "string" ? body.subject : "";
+      message = typeof body.message === "string" ? body.message : "";
+    } else {
+      // Form-urlencoded or multipart.
+      const form = await request.formData();
+      name = String(form.get("name") || "");
+      email = String(form.get("email") || "");
+      subject = String(form.get("subject") || "");
+      message = String(form.get("message") || "");
+    }
+  } catch {
+    return wantsJson
+      ? json({ error: "Invalid request body" }, 400)
+      : htmlResponse(supportErrorHtml("Couldn't parse your submission. Please try again.", env), 400);
+  }
+
+  name = name.trim().slice(0, 120);
+  email = email.trim().toLowerCase().slice(0, 200);
+  subject = subject.trim().slice(0, 200);
+  message = message.trim().slice(0, 5000);
+
+  if (!name || !email || !subject || !message) {
+    return wantsJson
+      ? json({ error: "Missing field(s): name, email, subject, message are all required." }, 400)
+      : htmlResponse(supportErrorHtml("All four fields (name, email, subject, message) are required.", env), 400);
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return wantsJson
+      ? json({ error: "Invalid email address" }, 400)
+      : htmlResponse(supportErrorHtml("That doesn't look like a valid email address.", env), 400);
+  }
+
+  const ticketId = crypto.randomUUID();
+  const record = {
+    ticket_id: ticketId,
+    name,
+    email,
+    subject,
+    message,
+    product_slug: env.PRODUCT_NAME ?? "unknown",
+    user_ip: request.headers.get("cf-connecting-ip") || null,
+    user_agent: request.headers.get("user-agent") || null,
+    created_at: new Date().toISOString(),
+  };
+  // 90-day TTL — matches our event/audit log window.
+  await env.USAGE.put(`support:${ticketId}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 });
+
+  if (wantsJson) {
+    return json({ ok: true, ticket_id: ticketId, message: "Thanks — we'll reply via email within 2 business days." }, 201);
+  }
+  return htmlResponse(supportThanksHtml(ticketId, env), 200);
+}
+
+function supportThanksHtml(ticketId: string, env: CheckoutEnv): string {
+  const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const productUrl = env.PRODUCT_URL || "";
+  const meta = buildSocialMeta(env, {
+    title: `Thanks — ${productName}`,
+    description: `Support request received for ${productName}. ${tagline}`,
+    url: `${productUrl}/support`,
+  });
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Thanks — ${escapeHtml(productName)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>Thanks — message received.</h1>
+<p>We'll reply via email within 2 business days. Your ticket reference:</p>
+<div class="key"><code>${escapeHtml(ticketId)}</code></div>
+<p>Quote that reference if you follow up by email at <a href="mailto:prakshatechnologies@gmail.com">prakshatechnologies@gmail.com</a>.</p>
+<p><a href="/" class="btn">Back to ${escapeHtml(productName)}</a></p>
+</body></html>`;
+}
+
+function supportErrorHtml(message: string, env: CheckoutEnv): string {
+  const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const productUrl = env.PRODUCT_URL || "";
+  const meta = buildSocialMeta(env, {
+    title: `Support error — ${productName}`,
+    description: tagline,
+    url: `${productUrl}/support`,
+  });
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Support error — ${escapeHtml(productName)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>Couldn't submit your message</h1>
+<div class="error"><p>${escapeHtml(message)}</p></div>
+<p><a href="/support" class="btn">Try again</a></p>
+</body></html>`;
+}
+
 async function sumTodayCalls(usage: KVNamespace, apiKey: string): Promise<number> {
   // Per-minute rate buckets carry only a 60-second TTL, so they don't survive long enough
   // to be summed over a full day. Today's calls are therefore derived from the monthly
@@ -297,7 +570,48 @@ export function buildSocialMeta(env: CheckoutEnv, page: { title: string; descrip
     `<meta name="twitter:title" content="${escapeAttr(page.title)}">`,
     `<meta name="twitter:description" content="${escapeAttr(desc)}">`,
     `<link rel="icon" type="image/svg+xml" href="/favicon.ico">`,
+    buildJsonLd(env, productUrl),
   ].join("\n");
+}
+
+/**
+ * SoftwareApplication JSON-LD for SEO / AI discovery (Google rich-results,
+ * Bing, Perplexity, ChatGPT search). Embedded into every landing page via
+ * `buildSocialMeta`. Prices default to the canonical $9/$29/$79 band; products
+ * with custom pricing override via PRICE_SOLO / PRICE_TEAM / PRICE_PRO env
+ * vars in wrangler.toml.
+ */
+export function buildJsonLd(env: CheckoutEnv, productUrl: string): string {
+  const name = env.PRODUCT_NAME || "MCP server";
+  const tagline = env.PRODUCT_TAGLINE || "Hosted MCP server for AI agents.";
+  const priceSolo = env.PRICE_SOLO || "9";
+  const priceTeam = env.PRICE_TEAM || "29";
+  const pricePro = env.PRICE_PRO || "79";
+  const schema = {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name,
+    applicationCategory: "DeveloperApplication",
+    operatingSystem: "Cross-platform (Cloudflare Workers, MCP)",
+    description: tagline,
+    url: productUrl,
+    offers: [
+      { "@type": "Offer", name: "Free", price: "0", priceCurrency: "USD" },
+      { "@type": "Offer", name: "Solo", price: priceSolo, priceCurrency: "USD", priceSpecification: { "@type": "UnitPriceSpecification", billingDuration: "P1M" } },
+      { "@type": "Offer", name: "Team", price: priceTeam, priceCurrency: "USD", priceSpecification: { "@type": "UnitPriceSpecification", billingDuration: "P1M" } },
+      { "@type": "Offer", name: "Pro", price: pricePro, priceCurrency: "USD", priceSpecification: { "@type": "UnitPriceSpecification", billingDuration: "P1M" } },
+    ],
+    author: {
+      "@type": "Person",
+      name: "Prakhar Gupta",
+      email: "prakshatechnologies@gmail.com",
+      url: "https://github.com/guptaprakhariitr",
+    },
+    license: "MIT",
+  };
+  // Escape </script> defensively so the JSON payload can never break out of the script block.
+  const payload = JSON.stringify(schema).replace(/<\/script/gi, "<\\/script");
+  return `<script type="application/ld+json">${payload}</script>`;
 }
 
 function escapeAttr(s: string): string {
