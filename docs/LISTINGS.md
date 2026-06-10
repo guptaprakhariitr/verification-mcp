@@ -37,7 +37,7 @@ Multi-field form. Use the values below.
 - **Display name:** `SEC EDGAR`
 - **Description (short):** `Real-time SEC EDGAR access for AI agents — filings search, 10-K/8-K reading, XBRL facts, Form 4 insider trades. Free underlying data, indie pricing from $9/mo.`
 - **GitHub URL:** `https://github.com/guptaprakhariitr/sec-edgar-mcp`
-- **Endpoint URL:** `https://sec-edgar-mcp.prakhar-cognizance.workers.dev/mcp`
+- **Endpoint URL:** `https://sec-edgar-mcp.atlasword.workers.dev/mcp`
 - **Category / tags:** finance, research, sec, edgar, xbrl
 - **License:** MIT
 - **Transport:** HTTP (remote)
@@ -76,7 +76,7 @@ Curated. Application form.
   >
   > Search filings, read 10-K/8-K, query XBRL facts, track Form 4 insider trades. Free underlying data.
   >
-  > Endpoint: https://sec-edgar-mcp.prakhar-cognizance.workers.dev/mcp
+  > Endpoint: https://sec-edgar-mcp.atlasword.workers.dev/mcp
   > GitHub: https://github.com/guptaprakhariitr/sec-edgar-mcp
   >
   > $9/mo for 2k calls, $29/mo team, $79/mo pro. Free tier 100 calls/mo no signup.

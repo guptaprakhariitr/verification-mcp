@@ -5,11 +5,11 @@
   "description": "Real-time fact-checking + citation verification + source-freshness for AI agents. Wikipedia, Wikidata, Crossref, Wayback Machine — all free underlying data.",
   "version": "0.1.0",
   "license": "MIT",
-  "homepage": "https://verification-mcp.prakhar-cognizance.workers.dev",
+  "homepage": "https://verification-mcp.atlasword.workers.dev",
   "repository": "https://github.com/guptaprakhariitr/verification-mcp",
   "categories": ["research", "ai-safety", "verification"],
   "tags": ["fact-check", "citation", "verification", "grounding", "hallucination", "wikipedia", "crossref", "wayback"],
-  "transport": { "type": "http", "url": "https://verification-mcp.prakhar-cognizance.workers.dev/mcp" },
+  "transport": { "type": "http", "url": "https://verification-mcp.atlasword.workers.dev/mcp" },
   "auth": { "type": "bearer", "freeTier": { "monthlyCalls": 50, "ratePerMinute": 10 } },
   "tools": ["fact_check", "cite_check", "source_freshness"],
   "pricing": { "currency": "USD", "tiers": [

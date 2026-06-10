@@ -5,7 +5,7 @@
   "description": "MCP server for AI agents: fact_check, cite_check, source_freshness. Wraps Wikipedia, Wikidata, Crossref, Wayback Machine.",
   "type": "module",
   "main": "src/index.ts",
-  "homepage": "https://verification-mcp.prakhar-cognizance.workers.dev",
+  "homepage": "https://verification-mcp.atlasword.workers.dev",
   "repository": { "type": "git", "url": "https://github.com/guptaprakhariitr/verification-mcp.git" },
   "scripts": {
     "dev": "wrangler dev",

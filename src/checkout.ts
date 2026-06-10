@@ -447,9 +447,9 @@ function slugFromProduct(name?: string): string {
 }
 
 function cfSubdomain(): string {
-  // Hardcoded for this deployment; products self-deployed under prakhar-cognizance.
+  // Hardcoded for this deployment; products self-deployed under atlasword.
   // If multi-tenant, this should come from an env var.
-  return "prakhar-cognizance";
+  return "atlasword";
 }
 
 // ── Team-member invitations ──────────────────────────────────────────────────

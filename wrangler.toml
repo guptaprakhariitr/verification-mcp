@@ -15,7 +15,7 @@ binding = "USAGE"
 id = "e77723d9adbb4dd38fbb05670e46e9b9"
 
 [vars]
-UPGRADE_URL = "https://verification-mcp.prakhar-cognizance.workers.dev/upgrade"
+UPGRADE_URL = "https://verification-mcp.atlasword.workers.dev/upgrade"
 WIKIPEDIA_BASE = "https://en.wikipedia.org/api/rest_v1"
 WIKIDATA_BASE = "https://query.wikidata.org"
 CROSSREF_BASE = "https://api.crossref.org"
@@ -23,13 +23,13 @@ WAYBACK_BASE = "https://archive.org/wayback"
 USER_AGENT = "verification-mcp/0.1 (prakshatechnologies@gmail.com)"
 PRODUCT_NAME = "verification-mcp"
 PRODUCT_TAGLINE = "MCP server for AI agents: fact_check, cite_check, source_freshness. Wraps Wikipedia, Wikidata, Crossref, Wayback."
-PRODUCT_URL = "https://verification-mcp.prakhar-cognizance.workers.dev"
+PRODUCT_URL = "https://verification-mcp.atlasword.workers.dev"
 DODO_PRODUCT_ID_SOLO = "pdt_0NgkXBc8gHAsSTspAejXX"
 DODO_PRODUCT_ID_TEAM = "pdt_0NgkXBn1JF0Uwp8Os0hsd"
 DODO_PRODUCT_ID_PRO  = "pdt_0NgkXBpkVhPcikDQV3vYm"
 FROM_EMAIL = "prakshatechnologies@gmail.com"
 DODO_BASE = "https://live.dodopayments.com"
-CUSTOMER_PORTAL_RETURN_URL = "https://verification-mcp.prakhar-cognizance.workers.dev/account"
+CUSTOMER_PORTAL_RETURN_URL = "https://verification-mcp.atlasword.workers.dev/account"
 
 # Secrets:
 #   DODO_API_KEY

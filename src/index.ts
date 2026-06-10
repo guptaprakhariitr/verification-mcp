@@ -98,7 +98,7 @@ const LLMS_TXT = `# verification-mcp
 - Post-processing LLM output to flag possible hallucinations.
 - A RAG pipeline needs to verify its retrieved sources are still valid.
 
-Endpoint: https://verification-mcp.prakhar-cognizance.workers.dev/mcp
+Endpoint: https://verification-mcp.atlasword.workers.dev/mcp
 `;
 function renderLanding(env: Env, url: URL): string {
   const productName = env.PRODUCT_NAME ?? "verification-mcp";
@@ -115,7 +115,7 @@ function renderLanding(env: Env, url: URL): string {
 <body><h1>verification-mcp</h1>
 <p>Real-time fact-check + citation + source-freshness for AI agents.</p>
 <p>Wikipedia + Wikidata + Crossref + Wayback Machine, all free underlying data.</p>
-<p>Endpoint: <code>POST https://verification-mcp.prakhar-cognizance.workers.dev/mcp</code></p>
+<p>Endpoint: <code>POST https://verification-mcp.atlasword.workers.dev/mcp</code></p>
 <h2>Pricing</h2>
 <ul>
   <li>Free — 50 verifications/mo</li>
