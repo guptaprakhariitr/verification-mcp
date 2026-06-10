@@ -1,0 +1,21 @@
+{
+  "$schema": "https://smithery.ai/schema/server.json",
+  "name": "verification-mcp",
+  "displayName": "Verification (fact-check + cite-check)",
+  "description": "Real-time fact-checking + citation verification + source-freshness for AI agents. Wikipedia, Wikidata, Crossref, Wayback Machine — all free underlying data.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "homepage": "https://verification-mcp.prakhar-cognizance.workers.dev",
+  "repository": "https://github.com/guptaprakhariitr/verification-mcp",
+  "categories": ["research", "ai-safety", "verification"],
+  "tags": ["fact-check", "citation", "verification", "grounding", "hallucination", "wikipedia", "crossref", "wayback"],
+  "transport": { "type": "http", "url": "https://verification-mcp.prakhar-cognizance.workers.dev/mcp" },
+  "auth": { "type": "bearer", "freeTier": { "monthlyCalls": 50, "ratePerMinute": 10 } },
+  "tools": ["fact_check", "cite_check", "source_freshness"],
+  "pricing": { "currency": "USD", "tiers": [
+    { "name": "Free", "price": 0,   "monthlyCalls": 50 },
+    { "name": "Solo", "price": 19,  "monthlyCalls": 1000 },
+    { "name": "Team", "price": 49,  "monthlyCalls": 5000 },
+    { "name": "Pro",  "price": 149, "monthlyCalls": 20000 }
+  ] }
+}
