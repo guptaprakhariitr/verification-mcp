@@ -60,8 +60,16 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
           newTier: tier as Tier,
         });
       }
+      // Write the welcome-token pointer so /welcome can resolve the key without
+      // requiring the buyer to authenticate (they don't have the key yet at
+      // redirect time). 24-hour TTL is plenty — buyers always see the page
+      // within seconds of payment; the entry expires on its own.
+      const welcomeToken = event.data.metadata?.welcome_token;
+      if (welcomeToken) {
+        await env.USAGE.put(`welcome:${welcomeToken}`, apiKey, { expirationTtl: 60 * 60 * 24 });
+      }
       await maybeSendKeyEmail(env, event.data.customer.email, apiKey, tier);
-      return new Response(JSON.stringify({ ok: true, apiKey_issued: !existing }), {
+      return new Response(JSON.stringify({ ok: true, apiKey_issued: !existing, welcome_token_set: !!welcomeToken }), {
         status: 200, headers: { "Content-Type": "application/json" },
       });
     }

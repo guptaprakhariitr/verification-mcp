@@ -3,7 +3,7 @@
 import { extractBearer, resolveKey, Tier } from "./auth";
 import { checkAndIncrement, quotaErrorResponse } from "./billing";
 import { McpServer, ToolContext, isJsonRpcRequest } from "./mcp-server";
-import { handleUpgrade, handleAccount } from "./checkout";
+import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome } from "./checkout";
 import { handleDodoWebhook } from "./webhook";
 import { buildTools } from "./tools";
 
@@ -40,6 +40,8 @@ export default {
     if (request.method === "GET" && url.pathname === "/") return new Response(LANDING, { headers: { "Content-Type": "text/html" } });
     if (request.method === "GET" && url.pathname === "/upgrade") return handleUpgrade(request, env, new URL(request.url).origin);
     if (request.method === "GET" && url.pathname === "/account") return withCors(await handleAccount(request, env));
+    if (request.method === "GET" && (url.pathname === "/welcome" || url.pathname === "/welcome.json")) return withCors(await handleWelcome(request, env));
+    if (request.method === "POST" && url.pathname === "/account/rotate") return withCors(await handleAccountRotate(request, env));
     if (request.method === "POST" && url.pathname === "/webhooks/dodo") return await handleDodoWebhook(request, env);
     if (url.pathname !== "/mcp") return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
