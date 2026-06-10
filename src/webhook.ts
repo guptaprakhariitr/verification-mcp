@@ -13,6 +13,34 @@ import {
   Tier,
 } from "./auth";
 
+// 90-day TTL for stored event log entries (matches the GDPR export window in /account/export).
+const EVENT_TTL_SECONDS = 60 * 60 * 24 * 90;
+
+/**
+ * Records a webhook event in KV under `event:<apikey>:<ts>:<type>` so that
+ * the GDPR-export endpoint (/account/export) can return a user-visible audit
+ * trail of subscription / payment events. Best-effort: any failure is logged
+ * but never blocks the webhook response.
+ */
+async function logEvent(
+  usage: KVNamespace,
+  apiKey: string,
+  type: string,
+  data: Record<string, unknown>
+): Promise<void> {
+  const at = new Date().toISOString();
+  const key = `event:${apiKey}:${at}:${type}`;
+  try {
+    await usage.put(
+      key,
+      JSON.stringify({ type, at, data }),
+      { expirationTtl: EVENT_TTL_SECONDS }
+    );
+  } catch (err) {
+    console.error("logEvent failed:", err);
+  }
+}
+
 export interface WebhookEnv extends DodoEnv {
   USAGE: KVNamespace;
   RESEND_API_KEY?: string;
@@ -69,6 +97,9 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
         await env.USAGE.put(`welcome:${welcomeToken}`, apiKey, { expirationTtl: 60 * 60 * 24 });
       }
       await maybeSendKeyEmail(env, event.data.customer.email, apiKey, tier);
+      await logEvent(env.USAGE, apiKey, "subscription.active", {
+        tier, subscription_id: event.data.subscription_id, customer_id: event.data.customer.customer_id,
+      });
       return new Response(JSON.stringify({ ok: true, apiKey_issued: !existing, welcome_token_set: !!welcomeToken }), {
         status: 200, headers: { "Content-Type": "application/json" },
       });
@@ -76,40 +107,48 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
 
     case "subscription.renewed": {
       if (!event.data.subscription_id) return new Response("Missing subscription_id", { status: 400 });
-      await updateKeyStatus({
+      const updated = await updateKeyStatus({
         usage: env.USAGE,
         subscriptionId: event.data.subscription_id,
         status: "active",
       });
+      if (updated) await logEvent(env.USAGE, updated.apiKey, "subscription.renewed", { subscription_id: event.data.subscription_id });
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
     case "subscription.cancelled": {
       if (!event.data.subscription_id) return new Response("Missing subscription_id", { status: 400 });
-      await updateKeyStatus({
+      const updated = await updateKeyStatus({
         usage: env.USAGE,
         subscriptionId: event.data.subscription_id,
         status: "cancelled",
       });
+      if (updated) await logEvent(env.USAGE, updated.apiKey, "subscription.cancelled", { subscription_id: event.data.subscription_id });
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
     case "subscription.failed":
     case "payment.failed": {
       if (event.data.subscription_id) {
-        await updateKeyStatus({
+        const updated = await updateKeyStatus({
           usage: env.USAGE,
           subscriptionId: event.data.subscription_id,
           status: "past_due",
         });
+        if (updated) await logEvent(env.USAGE, updated.apiKey, event.type, { subscription_id: event.data.subscription_id });
       }
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
-    case "payment.succeeded":
+    case "payment.succeeded": {
       // Pure payment-succeeded without subscription_id (one-off purchase): no key issuance.
       // If there is a subscription_id, subscription.renewed will fire too — handled there.
+      if (event.data.subscription_id) {
+        const existing = await getKeyBySubscription(env.USAGE, event.data.subscription_id);
+        if (existing) await logEvent(env.USAGE, existing.apiKey, "payment.succeeded", { subscription_id: event.data.subscription_id });
+      }
       return new Response(JSON.stringify({ ok: true, note: "no-op" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
 
     default:
       return new Response(JSON.stringify({ ok: true, note: `event type ${event.type} ignored` }), {

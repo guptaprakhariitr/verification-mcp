@@ -3,7 +3,7 @@
 import { extractBearer, resolveKey, Tier } from "./auth";
 import { checkAndIncrement, quotaErrorResponse } from "./billing";
 import { McpServer, ToolContext, isJsonRpcRequest } from "./mcp-server";
-import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome } from "./checkout";
+import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleFavicon, buildSocialMeta } from "./checkout";
 import { handleDodoWebhook } from "./webhook";
 import { buildTools } from "./tools";
 
@@ -25,7 +25,7 @@ export interface Env {
   CUSTOMER_PORTAL_RETURN_URL?: string;
   RESEND_API_KEY?: string;
   FROM_EMAIL?: string;
-  PRODUCT_NAME?: string;
+  PRODUCT_NAME?: string; PRODUCT_TAGLINE?: string; PRODUCT_URL?: string;
 }
 
 const SERVER_INFO = { name: "verification-mcp", version: "0.1.0" };
@@ -37,9 +37,11 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, server: SERVER_INFO });
     if (request.method === "GET" && url.pathname === "/llms.txt") return new Response(LLMS_TXT, { headers: { "Content-Type": "text/markdown" } });
-    if (request.method === "GET" && url.pathname === "/") return new Response(LANDING, { headers: { "Content-Type": "text/html" } });
+    if (request.method === "GET" && (url.pathname === "/favicon.ico" || url.pathname === "/favicon.svg")) return handleFavicon();
+    if (request.method === "GET" && url.pathname === "/") return new Response(renderLanding(env, url), { headers: { "Content-Type": "text/html" } });
     if (request.method === "GET" && url.pathname === "/upgrade") return handleUpgrade(request, env, new URL(request.url).origin);
     if (request.method === "GET" && url.pathname === "/account") return withCors(await handleAccount(request, env));
+    if (request.method === "GET" && url.pathname === "/account/export") return withCors(await handleAccountExport(request, env));
     if (request.method === "GET" && (url.pathname === "/welcome" || url.pathname === "/welcome.json")) return withCors(await handleWelcome(request, env));
     if (request.method === "POST" && url.pathname === "/account/rotate") return withCors(await handleAccountRotate(request, env));
     if (request.method === "POST" && url.pathname === "/webhooks/dodo") return await handleDodoWebhook(request, env);
@@ -93,8 +95,18 @@ const LLMS_TXT = `# verification-mcp
 
 Endpoint: https://verification-mcp.prakhar-cognizance.workers.dev/mcp
 `;
-const LANDING = `<!doctype html><html><head><meta charset="utf-8"><title>verification-mcp</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;max-width:720px;margin:4rem auto;padding:0 1rem}code{background:#f3f3f3;padding:.1em .35em;border-radius:3px}</style></head>
+function renderLanding(env: Env, url: URL): string {
+  const productName = env.PRODUCT_NAME ?? "verification-mcp";
+  const tagline = env.PRODUCT_TAGLINE ?? "MCP server for AI agents: fact_check, cite_check, source_freshness. Wraps Wikipedia, Wikidata, Crossref, Wayback.";
+  const meta = buildSocialMeta(env, {
+    title: `${productName}`,
+    description: tagline,
+    url: env.PRODUCT_URL || url.origin,
+  });
+  void productName; void tagline;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>verification-mcp</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:720px;margin:4rem auto;padding:0 1rem}code{background:#f3f3f3;padding:.1em .35em;border-radius:3px}</style>${meta}
+</head>
 <body><h1>verification-mcp</h1>
 <p>Real-time fact-check + citation + source-freshness for AI agents.</p>
 <p>Wikipedia + Wikidata + Crossref + Wayback Machine, all free underlying data.</p>
@@ -108,3 +120,4 @@ const LANDING = `<!doctype html><html><head><meta charset="utf-8"><title>verific
 </ul>
 <p><a href="/upgrade?tier=solo">Upgrade →</a></p>
 </body></html>`;
+}

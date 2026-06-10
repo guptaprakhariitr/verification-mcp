@@ -1,4 +1,4 @@
-// Checkout entry points — `/upgrade`, `/welcome`, `/account` routes.
+// Checkout entry points — `/upgrade`, `/welcome`, `/account`, `/account/export`, `/favicon.ico` routes.
 // Vendored identically into every Category-1 product.
 
 import { DodoClient, DodoEnv } from "./dodo";
@@ -7,6 +7,8 @@ import { Tier, TIER_LIMITS, extractBearer, resolveKey, monthKey, generateApiKey,
 export interface CheckoutEnv extends DodoEnv {
   USAGE: KVNamespace;
   PRODUCT_NAME?: string;
+  PRODUCT_TAGLINE?: string;
+  PRODUCT_URL?: string;
 }
 
 /**
@@ -53,7 +55,7 @@ export async function handleUpgrade(request: Request, env: CheckoutEnv, returnUr
 export async function handleWelcome(request: Request, env: CheckoutEnv): Promise<Response> {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
-  if (!token) return htmlResponse(welcomeErrorHtml("Missing ?token= in URL. This page is only reachable after a successful payment redirect.", env), 400);
+  if (!token) return htmlResponse(welcomeErrorHtml("Missing ?token= in URL. This page is only reachable after a successful payment redirect.", env, url), 400);
 
   const apiKey = await env.USAGE.get(`welcome:${token}`);
   // JSON probe path: /welcome.json?token=... — used by the page's polling JS.
@@ -64,10 +66,10 @@ export async function handleWelcome(request: Request, env: CheckoutEnv): Promise
   }
   if (!apiKey) {
     // Webhook hasn't landed yet → show processing page with auto-refresh.
-    return htmlResponse(welcomeProcessingHtml(token, env), 202);
+    return htmlResponse(welcomeProcessingHtml(token, env, url), 202);
   }
   const rec = await env.USAGE.get<KeyRecord>(`key:${apiKey}`, "json");
-  return htmlResponse(welcomeSuccessHtml(apiKey, rec, env), 200);
+  return htmlResponse(welcomeSuccessHtml(apiKey, rec, env, url), 200);
 }
 
 /**
@@ -142,6 +144,123 @@ export async function handleAccountRotate(request: Request, env: CheckoutEnv): P
   });
 }
 
+/**
+ * GET /account/export — GDPR "right to data portability" endpoint.
+ *
+ * Requires Authorization: Bearer <api-key>. Returns a JSON dump of every
+ * piece of personal data we hold for the requester:
+ *   - account record   (KV `key:<apikey>`)
+ *   - subscription info (subscriptionId + last-known status from the key record)
+ *   - usage counters    (current day not tracked separately → reuse rate buckets, plus current month)
+ *   - webhook events    (KV `event:<apikey>:<eventid>` — last 90 days, written by webhook handler)
+ *
+ * No data is invented; whatever the existing schema stores is mirrored here.
+ */
+export async function handleAccountExport(request: Request, env: CheckoutEnv): Promise<Response> {
+  const apiKey = extractBearer(request);
+  if (!apiKey) {
+    return json({ error: "Missing Authorization header", hint: "Send Authorization: Bearer <your_mck_key>." }, 401);
+  }
+
+  const rec = await env.USAGE.get<KeyRecord>(`key:${apiKey}`, "json");
+  if (!rec) {
+    return json({ error: "Unknown API key" }, 404);
+  }
+
+  // Usage figures: monthly counter (always tracked) + today's calls (sum of per-minute buckets for today).
+  const month = monthKey();
+  const monthCalls = parseInt((await env.USAGE.get(`counter:${apiKey}:${month}`)) || "0", 10);
+  const tierLimit = TIER_LIMITS[rec.tier].monthlyCalls;
+
+  // Today's calls — sum the 1440 per-minute rate buckets for today. Most will be missing (60s TTL),
+  // so this is a best-effort lower bound; we mirror only what KV still holds.
+  const todayCalls = await sumTodayCalls(env.USAGE, apiKey);
+
+  // Recent webhook events, last 90 days. Webhook handler writes `event:<apikey>:<ts>:<type>` with
+  // a 90-day TTL; if the list is empty (e.g. before event logging was wired up), we return [].
+  const events = await listRecentEvents(env.USAGE, apiKey);
+
+  return json({
+    exported_at: new Date().toISOString(),
+    account: {
+      api_key: apiKey,
+      email: rec.owner,
+      tier: rec.tier,
+      status: rec.status,
+      created_at: new Date(rec.createdAt).toISOString(),
+      monthly_reset_at: new Date(rec.monthlyResetAt).toISOString(),
+      customer_id: rec.customerId ?? null,
+    },
+    subscription: {
+      subscription_id: rec.subscriptionId ?? null,
+      status: rec.status,
+      current_period_end: new Date(rec.monthlyResetAt).toISOString(),
+    },
+    usage: {
+      today: todayCalls,
+      month: monthCalls,
+      limit: tierLimit,
+      month_bucket: month,
+    },
+    events,
+    notes: "This is a machine-readable export of every record we hold tied to your API key. To request deletion, email prakshatechnologies@gmail.com.",
+  });
+}
+
+async function sumTodayCalls(usage: KVNamespace, apiKey: string): Promise<number> {
+  // Per-minute rate buckets carry only a 60-second TTL, so they don't survive long enough
+  // to be summed over a full day. Today's calls are therefore derived from the monthly
+  // counter delta — but we don't keep yesterday's snapshot, so this is a best-effort
+  // estimate: list any remaining `rate:<apikey>:*` buckets that haven't yet expired.
+  const list = await usage.list({ prefix: `rate:${apiKey}:`, limit: 1000 });
+  let total = 0;
+  for (const k of list.keys) {
+    const v = await usage.get(k.name);
+    if (v) total += parseInt(v, 10) || 0;
+  }
+  return total;
+}
+
+interface StoredEvent {
+  type: string;
+  at: string;
+  data?: Record<string, unknown>;
+}
+
+async function listRecentEvents(usage: KVNamespace, apiKey: string): Promise<StoredEvent[]> {
+  const list = await usage.list({ prefix: `event:${apiKey}:`, limit: 1000 });
+  const events: StoredEvent[] = [];
+  for (const k of list.keys) {
+    const raw = await usage.get(k.name);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw) as StoredEvent;
+      events.push(parsed);
+    } catch {
+      // Skip malformed entries rather than failing the whole export.
+    }
+  }
+  // Newest first.
+  events.sort((a, b) => (b.at || "").localeCompare(a.at || ""));
+  return events;
+}
+
+/**
+ * GET /favicon.ico — minimalist SVG favicon. Same mark for every product.
+ * Served with a 1-week cache so browsers don't re-request on every page.
+ */
+export function handleFavicon(): Response {
+  // Indigo square with white "M" — recognizable across the MCP family.
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#4f46e5"/><text x="32" y="44" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,system-ui,sans-serif" font-size="40" font-weight="700" fill="#fff">M</text></svg>`;
+  return new Response(svg, {
+    status: 200,
+    headers: {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": "public, max-age=604800, immutable",
+    },
+  });
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function json(body: unknown, status = 200): Response {
@@ -150,6 +269,27 @@ function json(body: unknown, status = 200): Response {
 
 function htmlResponse(html: string, status = 200): Response {
   return new Response(html, { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+/** Builds <meta> tags for OG, Twitter card, and description in one block. */
+export function buildSocialMeta(env: CheckoutEnv, page: { title: string; description: string; url: string }): string {
+  const desc = page.description;
+  const productUrl = env.PRODUCT_URL || page.url;
+  return [
+    `<meta name="description" content="${escapeAttr(desc)}">`,
+    `<meta property="og:title" content="${escapeAttr(page.title)}">`,
+    `<meta property="og:description" content="${escapeAttr(desc)}">`,
+    `<meta property="og:type" content="website">`,
+    `<meta property="og:url" content="${escapeAttr(productUrl)}">`,
+    `<meta name="twitter:card" content="summary">`,
+    `<meta name="twitter:title" content="${escapeAttr(page.title)}">`,
+    `<meta name="twitter:description" content="${escapeAttr(desc)}">`,
+    `<link rel="icon" type="image/svg+xml" href="/favicon.ico">`,
+  ].join("\n");
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 
 const PAGE_CSS = `
@@ -173,11 +313,19 @@ const PAGE_CSS = `
   .footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid #e5e7eb;font-size:.85rem;color:#6b7280}
 `;
 
-function welcomeProcessingHtml(token: string, env: CheckoutEnv): string {
+function welcomeProcessingHtml(token: string, env: CheckoutEnv, url: URL): string {
   const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const meta = buildSocialMeta(env, {
+    title: `Processing your subscription — ${productName}`,
+    description: `Finalising your ${productName} subscription. ${tagline}`,
+    url: `${url.origin}/welcome`,
+  });
   return `<!doctype html><html><head><meta charset="utf-8"><title>Processing — ${productName}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"><style>${PAGE_CSS}</style></head><body>
-<h1>🎉 Payment received</h1>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>Payment received</h1>
 <div class="processing">
   <p><span class="spinner"></span> <strong>Generating your API key…</strong></p>
   <p>This usually takes 2–5 seconds. This page will auto-refresh when your key is ready.</p>
@@ -199,33 +347,49 @@ function welcomeProcessingHtml(token: string, env: CheckoutEnv): string {
 </body></html>`;
 }
 
-function welcomeErrorHtml(message: string, env: CheckoutEnv): string {
+function welcomeErrorHtml(message: string, env: CheckoutEnv, url: URL): string {
   const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
+  const meta = buildSocialMeta(env, {
+    title: `Error — ${productName}`,
+    description: tagline,
+    url: `${url.origin}/welcome`,
+  });
   return `<!doctype html><html><head><meta charset="utf-8"><title>Error — ${productName}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"><style>${PAGE_CSS}</style></head><body>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
 <h1>Something went wrong</h1>
 <div class="error"><p>${escapeHtml(message)}</p></div>
 <p><a href="/upgrade?tier=solo" class="btn">Try again</a></p>
 </body></html>`;
 }
 
-function welcomeSuccessHtml(apiKey: string, rec: KeyRecord | null, env: CheckoutEnv): string {
+function welcomeSuccessHtml(apiKey: string, rec: KeyRecord | null, env: CheckoutEnv, url: URL): string {
   const productName = env.PRODUCT_NAME ?? "your MCP";
+  const tagline = env.PRODUCT_TAGLINE ?? "Hosted MCP server for AI agents.";
   const tier = rec?.tier ?? "solo";
   const owner = rec?.owner ?? "";
   const limits = TIER_LIMITS[tier as Tier] ?? TIER_LIMITS.solo;
   const monthlyLimit = limits.monthlyCalls.toLocaleString();
   const ratePerMin = limits.ratePerMin;
+  const meta = buildSocialMeta(env, {
+    title: `Welcome to ${productName}`,
+    description: tagline,
+    url: `${url.origin}/welcome`,
+  });
 
   return `<!doctype html><html><head><meta charset="utf-8"><title>Welcome to ${productName}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"><style>${PAGE_CSS}</style></head><body>
-<h1>🎉 You're in. Welcome to ${productName}.</h1>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${meta}
+<style>${PAGE_CSS}</style></head><body>
+<h1>You're in. Welcome to ${productName}.</h1>
 <p>Subscription confirmed on the <strong>${tier}</strong> tier${owner ? " for <code>" + escapeHtml(owner) + "</code>" : ""}. Your API key is below — save it now; this page will not be shown again.</p>
 
 <h2>Your API key</h2>
 <div class="key">
   <code id="key">${escapeHtml(apiKey)}</code>
-  <button class="btn" onclick="navigator.clipboard.writeText(document.getElementById('key').textContent); this.textContent='✓ Copied'">Copy</button>
+  <button class="btn" onclick="navigator.clipboard.writeText(document.getElementById('key').textContent); this.textContent='Copied'">Copy</button>
 </div>
 
 <h2>What you get</h2>
@@ -250,6 +414,7 @@ function welcomeSuccessHtml(apiKey: string, rec: KeyRecord | null, env: Checkout
 <h2>Self-service</h2>
 <p>
   <a href="/account" class="btn">View account &amp; usage</a>
+  <a href="/account/export" class="btn">Export my data (GDPR)</a>
   <a href="${env.UPGRADE_URL}" class="btn">Manage subscription</a>
 </p>
 
