@@ -1,0 +1,67 @@
+# Smithery registry config — https://smithery.ai/docs/build/project-config/smithery-yaml
+# This is an HTTP-transport MCP server; Smithery hosts the listing and proxies
+# clients straight to our Cloudflare Workers endpoint.
+
+name: verification-mcp
+displayName: Verification (fact-check + cite-check)
+description: |
+  Real-time fact-checking + citation verification + source-freshness for AI agents. Wikipedia, Wikidata, Crossref, Wayback Machine — all free underlying data.
+homepage: https://verification-mcp.atlasword.workers.dev
+repository: https://github.com/guptaprakhariitr/verification-mcp
+license: MIT
+version: "0.1.0"
+
+runtime: container
+
+startCommand:
+  type: http
+  url: https://verification-mcp.atlasword.workers.dev/mcp
+  configSchema:
+    type: object
+    properties:
+      apiKey:
+        type: string
+        title: API key (optional)
+        description: |
+          Bearer token from https://verification-mcp.atlasword.workers.dev/upgrade.
+          Leave blank for the anonymous free tier (~100 calls/month/IP).
+    required: []
+  exampleConfig:
+    apiKey: ""
+  commandFunction: |-
+    (config) => ({
+      type: "http",
+      url: "https://verification-mcp.atlasword.workers.dev/mcp",
+      headers: config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}
+    })
+
+remote:
+  type: http
+  url: https://verification-mcp.atlasword.workers.dev/mcp
+
+categories:
+  - research
+  - ai-safety
+  - verification
+tags:
+  - fact-check
+  - citation
+  - verification
+  - grounding
+  - hallucination
+  - wikipedia
+  - crossref
+  - wayback
+
+tools:
+  - name: fact_check
+  - name: cite_check
+  - name: source_freshness
+
+auth:
+  type: bearer
+  required: false
+  description: |
+    Optional. Anonymous free tier works for ~100 calls/month per IP. For higher
+    quotas, grab a key from https://verification-mcp.atlasword.workers.dev/upgrade and pass
+    it as `Authorization: Bearer <key>`.

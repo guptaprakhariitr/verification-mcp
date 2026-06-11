@@ -202,3 +202,27 @@ MIT — see [LICENSE](LICENSE).
 - **Live status page:** [https://mcp-hub.atlasword.workers.dev/status](https://mcp-hub.atlasword.workers.dev/status)
 - **Machine-readable status:** [https://mcp-hub.atlasword.workers.dev/status.json](https://mcp-hub.atlasword.workers.dev/status.json)
 - **Source repo:** [https://github.com/guptaprakhariitr/verification-mcp](https://github.com/guptaprakhariitr/verification-mcp)
+
+
+## Install via npm (one-liner)
+
+A thin launcher is published as [`@atlasword/verification-mcp`](https://www.npmjs.com/package/@atlasword/verification-mcp) on npm. No manual URL to copy/paste:
+
+```bash
+npx -y @atlasword/verification-mcp
+```
+
+Or wire it into your MCP client:
+
+```jsonc
+{
+  "mcpServers": {
+    "verification": {
+      "command": "npx",
+      "args": ["-y", "@atlasword/verification-mcp"]
+    }
+  }
+}
+```
+
+The npm package is just a launcher — it shells out to [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) and points it at the hosted endpoint (`https://verification-mcp.atlasword.workers.dev/mcp`).
