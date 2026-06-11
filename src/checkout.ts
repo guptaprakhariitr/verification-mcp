@@ -3,8 +3,9 @@
 
 import { DodoClient, DodoEnv } from "./dodo";
 import { Tier, TIER_LIMITS, TEAM_SEAT_LIMITS, extractBearer, resolveKey, monthKey, generateApiKey, KeyRecord, TeamRecord, TeamMemberRecord } from "./auth";
+import { EmailEnv, sendWelcomeEmail, sendSupportTicketForward } from "./email";
 
-export interface CheckoutEnv extends DodoEnv {
+export interface CheckoutEnv extends DodoEnv, EmailEnv {
   USAGE: KVNamespace;
   PRODUCT_NAME?: string;
   PRODUCT_TAGLINE?: string;
@@ -16,6 +17,10 @@ export interface CheckoutEnv extends DodoEnv {
   PRICE_SOLO?: string;
   PRICE_TEAM?: string;
   PRICE_PRO?: string;
+  // Transactional email (Brevo).
+  BREVO_API_KEY?: string;
+  FROM_EMAIL?: string;
+  SUPPORT_FORWARD_EMAIL?: string;
 }
 
 /**
@@ -55,6 +60,14 @@ export async function handleUpgrade(request: Request, env: CheckoutEnv, returnUr
     await env.USAGE.put(`key:${apiKey}`, JSON.stringify(rec));
     const welcomeToken = crypto.randomUUID();
     await env.USAGE.put(`welcome:${welcomeToken}`, apiKey, { expirationTtl: 60 * 60 * 24 });
+    // Free-tier welcome email. Silently no-ops if Brevo isn't configured.
+    await sendWelcomeEmail(env, {
+      to: customer_email,
+      apiKey,
+      tier: "free",
+      productName: env.PRODUCT_NAME ?? "your MCP",
+      productUrl: env.PRODUCT_URL,
+    });
     return Response.redirect(`${returnUrlBase}/welcome?token=${welcomeToken}`, 302);
   }
 
@@ -477,6 +490,17 @@ export async function handleSupportSubmit(request: Request, env: CheckoutEnv): P
   };
   // 90-day TTL — matches our event/audit log window.
   await env.USAGE.put(`support:${ticketId}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 });
+
+  // Forward to operator inbox. Best-effort; never block the user response.
+  await sendSupportTicketForward(env, {
+    ticketId,
+    userName: name,
+    userEmail: email,
+    userSubject: subject,
+    userMessage: message,
+    productName: env.PRODUCT_NAME ?? "your MCP",
+    productUrl: env.PRODUCT_URL,
+  });
 
   if (wantsJson) {
     return json({ ok: true, ticket_id: ticketId, message: "Thanks — we'll reply via email within 2 business days." }, 201);

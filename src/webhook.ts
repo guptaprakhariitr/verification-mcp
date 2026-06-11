@@ -12,6 +12,12 @@ import {
   mintApiKey, updateKeyStatus, getKeyBySubscription,
   Tier,
 } from "./auth";
+import {
+  EmailEnv,
+  sendWelcomeEmail,
+  sendPaymentReceipt,
+  sendCancellationEmail,
+} from "./email";
 
 // 90-day TTL for stored event log entries (matches the GDPR export window in /account/export).
 const EVENT_TTL_SECONDS = 60 * 60 * 24 * 90;
@@ -41,11 +47,14 @@ async function logEvent(
   }
 }
 
-export interface WebhookEnv extends DodoEnv {
+export interface WebhookEnv extends DodoEnv, EmailEnv {
   USAGE: KVNamespace;
-  RESEND_API_KEY?: string;
-  FROM_EMAIL?: string;          // e.g. "billing@your-domain.com"
+  RESEND_API_KEY?: string;       // legacy — superseded by BREVO_API_KEY
+  FROM_EMAIL?: string;          // e.g. "prakshatechnologies@gmail.com"
+  SUPPORT_FORWARD_EMAIL?: string;
   PRODUCT_NAME?: string;        // e.g. "sec-edgar-mcp"
+  PRODUCT_URL?: string;
+  BREVO_API_KEY?: string;
 }
 
 export async function handleDodoWebhook(request: Request, env: WebhookEnv): Promise<Response> {
@@ -97,6 +106,17 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
         await env.USAGE.put(`welcome:${welcomeToken}`, apiKey, { expirationTtl: 60 * 60 * 24 });
       }
       await maybeSendKeyEmail(env, event.data.customer.email, apiKey, tier);
+      // Brevo welcome email — runs in addition to the legacy Resend path; both
+      // no-op if their respective API keys aren't configured.
+      if (event.data.customer.email) {
+        await sendWelcomeEmail(env, {
+          to: event.data.customer.email,
+          apiKey,
+          tier,
+          productName: env.PRODUCT_NAME ?? "your MCP",
+          productUrl: env.PRODUCT_URL,
+        });
+      }
       await logEvent(env.USAGE, apiKey, "subscription.active", {
         tier, subscription_id: event.data.subscription_id, customer_id: event.data.customer.customer_id,
       });
@@ -123,7 +143,18 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
         subscriptionId: event.data.subscription_id,
         status: "cancelled",
       });
-      if (updated) await logEvent(env.USAGE, updated.apiKey, "subscription.cancelled", { subscription_id: event.data.subscription_id });
+      if (updated) {
+        await logEvent(env.USAGE, updated.apiKey, "subscription.cancelled", { subscription_id: event.data.subscription_id });
+        const cancelEmail = event.data.customer?.email || updated.rec.owner;
+        if (cancelEmail) {
+          await sendCancellationEmail(env, {
+            to: cancelEmail,
+            productName: env.PRODUCT_NAME ?? "your MCP",
+            productUrl: env.PRODUCT_URL,
+            periodEnd: updated.rec.monthlyResetAt ? new Date(updated.rec.monthlyResetAt).toISOString().slice(0, 10) : undefined,
+          });
+        }
+      }
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -146,6 +177,35 @@ export async function handleDodoWebhook(request: Request, env: WebhookEnv): Prom
       if (event.data.subscription_id) {
         const existing = await getKeyBySubscription(env.USAGE, event.data.subscription_id);
         if (existing) await logEvent(env.USAGE, existing.apiKey, "payment.succeeded", { subscription_id: event.data.subscription_id });
+      }
+      // Send a receipt email — driven entirely off the event payload so this
+      // works for both subscription and one-off charges. Dodo doesn't include
+      // a guaranteed amount field, so we pass whatever's present on the event
+      // and let the helper omit absent fields gracefully.
+      const receiptTo = event.data.customer?.email;
+      if (receiptTo) {
+        const anyData = event.data as unknown as { amount?: number | string; currency?: string; total?: number | string };
+        const amountRaw = anyData.amount ?? anyData.total;
+        const currency = anyData.currency ? String(anyData.currency).toUpperCase() : undefined;
+        let amount: string | undefined;
+        if (amountRaw !== undefined && amountRaw !== null) {
+          const n = typeof amountRaw === "number" ? amountRaw : Number(amountRaw);
+          if (!Number.isNaN(n)) {
+            // Dodo amounts are minor units (cents) for fiat. Convert if >= 100 to avoid "0.09" gotchas.
+            const major = n >= 100 ? n / 100 : n;
+            amount = currency === "USD" || !currency ? `$${major.toFixed(2)}` : `${major.toFixed(2)} ${currency}`;
+          }
+        }
+        await sendPaymentReceipt(env, {
+          to: receiptTo,
+          productName: env.PRODUCT_NAME ?? "your MCP",
+          amount,
+          currency,
+          period: event.data.subscription_id ? "Monthly" : undefined,
+          subscriptionId: event.data.subscription_id,
+          paymentId: event.data.payment_id,
+          portalUrl: env.PRODUCT_URL ? `${env.PRODUCT_URL}/account` : undefined,
+        });
       }
       return new Response(JSON.stringify({ ok: true, note: "no-op" }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
