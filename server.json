@@ -3,7 +3,7 @@
   "name": "io.github.guptaprakhariitr/verification-mcp",
   "title": "Citation Verification",
   "description": "Real-time fact-check, citation verification, and source-freshness for AI agents.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "websiteUrl": "https://verification-mcp.atlasword.workers.dev/",
   "repository": {
     "url": "https://github.com/guptaprakhariitr/verification-mcp",
@@ -13,6 +13,16 @@
     {
       "type": "streamable-http",
       "url": "https://verification-mcp.atlasword.workers.dev/mcp"
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@insnapsprakhar/verification-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
     }
   ]
 }
