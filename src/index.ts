@@ -1,10 +1,12 @@
 // Worker entrypoint for verification-mcp.
 
 import { extractBearer, resolveKey, Tier } from "./auth";
-import { checkAndIncrement, quotaErrorResponse } from "./billing";
+import { checkAndIncrement, quotaErrorResponse, withRateLimitHeaders } from "./billing";
 import { McpServer, ToolContext, isJsonRpcRequest } from "./mcp-server";
 import { handleUpgrade, handleAccount, handleAccountRotate, handleWelcome, handleAccountExport, handleAccountDelete, handleSupportPage, handleSupportSubmit, handleFavicon, buildSocialMeta, handleTeamList, handleTeamInvite, handleTeamRevoke, handleTeamAccept } from "./checkout";
 import { handleDodoWebhook } from "./webhook";
+import { handleAdminListKeys, handleAdminListSupport, handleAdminListEvents } from "./admin";
+import { handleOpenApi } from "./openapi";
 import { buildTools } from "./tools";
 
 export interface Env {
@@ -26,11 +28,13 @@ export interface Env {
   RESEND_API_KEY?: string;
   FROM_EMAIL?: string;
   PRODUCT_NAME?: string; PRODUCT_TAGLINE?: string; PRODUCT_URL?: string;
+  ADMIN_TOKEN?: string;
 }
 
 const SERVER_INFO = { name: "verification-mcp", version: "0.1.0" };
+const TOOLS = buildTools();
 const server = new McpServer(SERVER_INFO);
-for (const t of buildTools()) server.register(t);
+for (const t of TOOLS) server.register(t);
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -53,6 +57,10 @@ export default {
     if (request.method === "POST" && url.pathname === "/account/team/revoke") return withCors(await handleTeamRevoke(request, env));
     if (request.method === "GET" && url.pathname === "/team/accept") return withCors(await handleTeamAccept(request, env));
     if (request.method === "POST" && url.pathname === "/webhooks/dodo") return await handleDodoWebhook(request, env);
+    if (request.method === "GET" && url.pathname === "/openapi.json") return withCors(handleOpenApi(env, { serverInfo: SERVER_INFO, tools: TOOLS, origin: url.origin }));
+    if (request.method === "GET" && url.pathname === "/admin/list-keys") return await handleAdminListKeys(request, env);
+    if (request.method === "GET" && url.pathname === "/admin/list-support") return await handleAdminListSupport(request, env);
+    if (request.method === "GET" && url.pathname === "/admin/list-events") return await handleAdminListEvents(request, env);
     if (url.pathname !== "/mcp") return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
     if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -70,7 +78,7 @@ export default {
     const ctx: ToolContext = { env: env as unknown as Record<string, any>, apiKey, tier: tier as Tier, callsRemaining: quota.callsRemaining };
     const r = await server.handle(body, ctx);
     if (r === null) return new Response(null, { status: 204, headers: corsHeaders() });
-    return withCors(json(r));
+    return withRateLimitHeaders(withCors(json(r)), tier as Tier, quota);
   },
 };
 

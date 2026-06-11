@@ -30,10 +30,34 @@ export interface CheckoutEnv extends DodoEnv {
 export async function handleUpgrade(request: Request, env: CheckoutEnv, returnUrlBase: string): Promise<Response> {
   const url = new URL(request.url);
   const tier = (url.searchParams.get("tier") ?? "solo") as Tier;
-  if (tier !== "solo" && tier !== "team" && tier !== "pro") {
-    return new Response("Invalid tier; one of solo, team, pro", { status: 400 });
+  if (tier !== "free" && tier !== "solo" && tier !== "team" && tier !== "pro") {
+    return new Response("Invalid tier; one of free, solo, team, pro", { status: 400 });
   }
   const customer_email = url.searchParams.get("email") ?? undefined;
+
+  // Free-tier explicit signup: skip Dodo entirely. Mint a free-tier key in KV
+  // and redirect to /welcome with a fresh token. Useful as a lead-capture
+  // channel for the free tier and as a stable "API key" path even for
+  // non-paying users (so /account works without anonymity surprises).
+  if (tier === "free") {
+    if (!customer_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer_email)) {
+      return new Response("Free tier signup requires a valid ?email=", { status: 400 });
+    }
+    const apiKey = generateApiKey();
+    const now = Date.now();
+    const rec: KeyRecord = {
+      tier: "free",
+      owner: customer_email,
+      createdAt: now,
+      monthlyResetAt: startOfNextMonthMs(now),
+      status: "active",
+    };
+    await env.USAGE.put(`key:${apiKey}`, JSON.stringify(rec));
+    const welcomeToken = crypto.randomUUID();
+    await env.USAGE.put(`welcome:${welcomeToken}`, apiKey, { expirationTtl: 60 * 60 * 24 });
+    return Response.redirect(`${returnUrlBase}/welcome?token=${welcomeToken}`, 302);
+  }
+
   const welcomeToken = crypto.randomUUID();
   const return_to = `${returnUrlBase}/welcome?token=${welcomeToken}`;
 
@@ -1058,6 +1082,11 @@ async function listTeamMembersForExport(usage: KVNamespace, ownerApiKey: string)
     });
   }
   return out;
+}
+
+function startOfNextMonthMs(now: number): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0, 0);
 }
 
 async function sha256Hex16(s: string): Promise<string> {
