@@ -206,10 +206,10 @@ MIT — see [LICENSE](LICENSE).
 
 ## Install via npm (one-liner)
 
-A thin launcher is published as [`@atlasword/verification-mcp`](https://www.npmjs.com/package/@atlasword/verification-mcp) on npm. No manual URL to copy/paste:
+A thin launcher is published as [`@insnapsprakhar/verification-mcp`](https://www.npmjs.com/package/@insnapsprakhar/verification-mcp) on npm. No manual URL to copy/paste:
 
 ```bash
-npx -y @atlasword/verification-mcp
+npx -y @insnapsprakhar/verification-mcp
 ```
 
 Or wire it into your MCP client:
@@ -219,7 +219,7 @@ Or wire it into your MCP client:
   "mcpServers": {
     "verification": {
       "command": "npx",
-      "args": ["-y", "@atlasword/verification-mcp"]
+      "args": ["-y", "@insnapsprakhar/verification-mcp"]
     }
   }
 }
